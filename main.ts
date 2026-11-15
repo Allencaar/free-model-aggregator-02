@@ -22,6 +22,14 @@
 //     cannot tax every later prompt with a rediscovery call. At most MAX_ATTEMPTS calls are
 //     spent on one prompt; the gateway caps a trial at 60 and the tie-break counts the calls
 //     the provider answered, so calls are never speculated in parallel.
+//   - proof: every prompt carries a unique token its answer must return, and the house credits
+//     a prompt only when the serving model's own recorded answer carries it. So an answer is
+//     checked before it is served: a 2xx answer whose text does not carry the token the
+//     request's last user message names is a failed attempt, and the prompt moves on to the
+//     next candidate. A model that misses the token twice cools down like a refusing one. If
+//     every candidate answers without the token, the best attempt's answer is served anyway:
+//     it earns nothing on quality, but its shape, usage and stop reason still count on the
+//     wire column, which a bare error would forfeit.
 //   - the trail: refusals a prompt recovered from are reported on its answer in the
 //     x-makefun-upstream-failures header, the only way the failover column can see them.
 //   - wires: an OpenAI request rides upstream as it came, with only the model swapped (plus
@@ -80,6 +88,8 @@ const CALL_TIMEOUT_MS = 20000;
 const MAX_ATTEMPTS = 4;
 /** Consecutive refusals after which a model is skipped while a fresh candidate remains. */
 const COOLDOWN_AFTER = 2;
+/** Token misses after which a model is likewise treated as cooling down. */
+const TOKEN_MISS_LIMIT = 2;
 /** The output cap named when a client body names none (the gateway refuses a call without one). */
 const DEFAULT_MAX_TOKENS = 1024;
 /** The gateway's own output cap: a client cap above it is refused, so it is clamped to it. */
@@ -106,6 +116,8 @@ let queue: Promise<void> = Promise.resolve();
 interface ModelState {
   calls: number;
   consecutiveRefusals: number;
+  /** Answers that came back without the prompt's token: the model talks, but not to the point. */
+  tokenMisses: number;
 }
 const modelState = new Map<string, ModelState>();
 
@@ -116,10 +128,32 @@ function log(message: string): void {
 function stateOf(modelId: string): ModelState {
   let state = modelState.get(modelId);
   if (state === undefined) {
-    state = { calls: 0, consecutiveRefusals: 0 };
+    state = { calls: 0, consecutiveRefusals: 0, tokenMisses: 0 };
     modelState.set(modelId, state);
   }
   return state;
+}
+
+/** The shape of the token every prompt carries and its answer must return. */
+const TOKEN_PATTERN = /[A-Z]{3,12}-[0-9]{4}/g;
+
+/**
+ * The token this request's answer must carry: the last token-shaped word of the last user
+ * message (the instruction that names it), or null when the request names none — in which
+ * case an answer cannot be proof-checked and is served as it comes.
+ */
+function expectedToken(canon: CanonRequest): string | null {
+  for (let i = canon.messages.length - 1; i >= 0; i--) {
+    const message = canon.messages[i];
+    if (message.role !== 'user') continue;
+    const text = message.parts
+      .filter((p) => p.kind === 'text')
+      .map((p) => (p.kind === 'text' ? p.text : ''))
+      .join('\n');
+    const found = text.match(TOKEN_PATTERN);
+    if (found !== null && found.length > 0) return found[found.length - 1];
+  }
+  return null;
 }
 
 /**
@@ -138,16 +172,17 @@ function servedModels(): ListedModel[] {
 
 /**
  * Every legal pick for one prompt, best first: free models meeting the requirements, ranked by
- * the brief's rating. Ties keep the brief's order. A model in cooldown (COOLDOWN_AFTER refusals
- * in a row) sorts behind every fresh model but stays in the list, so it is still tried when
- * nothing fresh remains.
+ * the brief's rating. Ties keep the brief's order. A cooling model (COOLDOWN_AFTER refusals in
+ * a row, or TOKEN_MISS_LIMIT answers without the prompt's token) sorts behind every fresh
+ * model but stays in the list, so it is still tried when nothing fresh remains.
  */
 function candidatesFor(requires: Requirement): ModelRow[] {
   const fresh: ModelRow[] = [];
   const cooling: ModelRow[] = [];
   for (const model of freeModels(brief)) {
     if (!meetsRequirements(requires, capabilitiesOf(model))) continue;
-    if (stateOf(model.id).consecutiveRefusals >= COOLDOWN_AFTER) cooling.push(model);
+    const state = stateOf(model.id);
+    if (state.consecutiveRefusals >= COOLDOWN_AFTER || state.tokenMisses >= TOKEN_MISS_LIMIT) cooling.push(model);
     else fresh.push(model);
   }
   const byRating = (a: ModelRow, b: ModelRow): number => b.rating_milli - a.rating_milli;
@@ -301,22 +336,43 @@ async function serve(clientWire: ClientWire, req: IncomingMessage, res: ServerRe
     return sendError(res, clientWire, 503, 'no_free_model', 'no_free_model', 'no free model in the brief meets this request', []);
   }
   const failures: FailureRow[] = [];
+  const token = expectedToken(canon);
+  /** The best answer that arrived without the token: served if nothing better carries it. */
+  let firstAnswer: { candidate: ModelRow; answer: CanonAnswer } | null = null;
   let lastDetail = 'no candidate was tried';
   let lastCode: string | null = null;
   for (const candidate of candidates.slice(0, MAX_ATTEMPTS)) {
     const attempt = await tryCandidate(candidate, clientWire, body, canon);
     if (attempt.ok) {
-      const rendered =
-        clientWire === 'openai'
-          ? answerToOpenAI(attempt.answer, candidate.id, canon.stream)
-          : answerToAnthropic(attempt.answer, candidate.id, canon.stream);
-      sendBody(res, 200, rendered.contentType, rendered.body, failures);
-      return;
+      if (token === null || attempt.answer.text.includes(token)) {
+        const rendered =
+          clientWire === 'openai'
+            ? answerToOpenAI(attempt.answer, candidate.id, canon.stream)
+            : answerToAnthropic(attempt.answer, candidate.id, canon.stream);
+        sendBody(res, 200, rendered.contentType, rendered.body, failures);
+        return;
+      }
+      // The model answered but not to the point: no token, so the house would credit the
+      // prompt nothing. Not a refusal — the trail stays upstream-only — but the prompt moves
+      // on, and the model is one miss closer to cooling down.
+      stateOf(candidate.id).tokenMisses += 1;
+      if (firstAnswer === null) firstAnswer = { candidate, answer: attempt.answer };
+      lastDetail = `${candidate.id} answered without the token`;
+      log(`prompt ${manifestIndex}: ${candidate.id} answered without the token`);
+      continue;
     }
     failures.push(attempt.failure);
     lastDetail = attempt.detail;
     lastCode = attempt.failure.code === '' ? null : attempt.failure.code;
     log(`prompt ${manifestIndex}: ${candidate.id} refused (${attempt.detail})`);
+  }
+  if (firstAnswer !== null) {
+    const rendered =
+      clientWire === 'openai'
+        ? answerToOpenAI(firstAnswer.answer, firstAnswer.candidate.id, canon.stream)
+        : answerToAnthropic(firstAnswer.answer, firstAnswer.candidate.id, canon.stream);
+    sendBody(res, 200, rendered.contentType, rendered.body, failures);
+    return;
   }
   sendError(
     res,
